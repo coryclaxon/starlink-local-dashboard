@@ -384,6 +384,38 @@ def _parse_wifi_clients(response: dict) -> list[dict]:
         })
     return out[:50]
 
+def _packed_floats(value) -> list[float]:
+    if isinstance(value, float):
+        return [value] if math.isfinite(value) else []
+    if not isinstance(value, (bytes, bytearray)) or len(value) % 4 != 0:
+        return []
+    out = []
+    for i in range(0, len(value), 4):
+        try:
+            f = struct.unpack_from("<f", value, i)[0]
+        except Exception:
+            continue
+        if math.isfinite(f) and 0 <= f < 10000:
+            out.append(round(f, 2))
+    return out
+
+def _float_list(d: dict, field: int) -> list[float]:
+    out = []
+    for v in d.get(field, []):
+        out.extend(_packed_floats(v))
+    return out
+
+def _speed_series(samples: list[float]) -> dict:
+    if not samples:
+        return {"current": 0.0, "min": 0.0, "max": 0.0, "avg": 0.0, "samples": []}
+    return {
+        "current": round(samples[-1], 2),
+        "min": round(min(samples), 2),
+        "max": round(max(samples), 2),
+        "avg": round(sum(samples) / len(samples), 2),
+        "samples": samples[-80:],
+    }
+
 def _parse_control_response(action: str, label: str, raw: bytes | None) -> dict:
     if not raw:
         return {"ok": False, "action": action, "label": label, "error": "Empty response"}
@@ -429,6 +461,19 @@ def _parse_control_response(action: str, label: str, raw: bytes | None) -> dict:
         if report:
             result["report"] = report[:2000]
         result["message"] = "Router self-test completed"
+    elif action == "speedtest_status":
+        resp = _sub(top, 1028)
+        status = _sub(resp, 1)
+        up = _float_list(_sub(status, 1000), 1)
+        down = _float_list(_sub(status, 1001), 1)
+        running = bool(_u(status, 1))
+        result["speedtest"] = {
+            "running": running,
+            "id": _u(status, 2),
+            "up": _speed_series(up),
+            "down": _speed_series(down),
+        }
+        result["message"] = "Speed test " + ("running" if running else "complete")
 
     return result
 
@@ -974,6 +1019,21 @@ main{padding:18px 24px;}
   font-family:monospace;font-size:12px;color:var(--muted);white-space:pre-wrap;max-height:180px;overflow:auto;}
 .control-output.ok{color:#F4F7FA;}
 .control-output.err{color:#FFB04D;}
+.speed-pop{position:fixed;right:24px;bottom:24px;width:min(420px,calc(100vw - 32px));z-index:30;
+  background:#050607;border:1px solid #2B2F35;border-radius:6px;box-shadow:0 18px 48px rgba(0,0,0,.55);}
+.speed-pop[hidden]{display:none;}
+.speed-head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;padding:14px 14px 10px;border-bottom:1px solid var(--faint);}
+.speed-title{font-size:13px;font-weight:600;text-transform:uppercase;letter-spacing:.07em;}
+.speed-state{font-family:monospace;font-size:12px;color:var(--muted);margin-top:4px;}
+.speed-close{width:28px;height:28px;background:#090A0B;color:#F4F7FA;border:1px solid var(--bdr);border-radius:4px;cursor:pointer;}
+.speed-body{padding:14px;}
+.speed-grid{display:grid;grid-template-columns:92px repeat(3,1fr);gap:8px;align-items:stretch;}
+.speed-cell{border:1px solid var(--faint);border-radius:4px;padding:9px 8px;min-width:0;background:#070809;}
+.speed-cell.h{font-size:10px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);font-weight:600;}
+.speed-cell.label{font-size:12px;color:var(--muted);display:flex;align-items:center;}
+.speed-val{font-family:monospace;font-size:16px;color:var(--text);white-space:nowrap;}
+.speed-unit{font-family:monospace;font-size:10px;color:var(--muted);margin-top:2px;}
+.speed-note{font-family:monospace;font-size:11px;color:var(--muted);margin-top:10px;}
 /* detail rows */
 .rows{display:flex;flex-direction:column;}
 .drow{display:flex;justify-content:space-between;align-items:center;
@@ -1257,6 +1317,33 @@ footer{text-align:center;padding:12px;font-size:11px;color:var(--faint);font-fam
   </div>
 </main>
 
+<div class="speed-pop" id="speed-pop" hidden>
+  <div class="speed-head">
+    <div>
+      <div class="speed-title">Speed test</div>
+      <div class="speed-state" id="speed-state">Waiting for router...</div>
+    </div>
+    <button class="speed-close" id="speed-close" type="button" title="Close">X</button>
+  </div>
+  <div class="speed-body">
+    <div class="speed-grid">
+      <div class="speed-cell h"></div>
+      <div class="speed-cell h">Current</div>
+      <div class="speed-cell h">Min</div>
+      <div class="speed-cell h">Max</div>
+      <div class="speed-cell label">Down</div>
+      <div class="speed-cell"><div class="speed-val" id="speed-down-current">-</div><div class="speed-unit">Mbps</div></div>
+      <div class="speed-cell"><div class="speed-val" id="speed-down-min">-</div><div class="speed-unit">Mbps</div></div>
+      <div class="speed-cell"><div class="speed-val" id="speed-down-max">-</div><div class="speed-unit">Mbps</div></div>
+      <div class="speed-cell label">Up</div>
+      <div class="speed-cell"><div class="speed-val" id="speed-up-current">-</div><div class="speed-unit">Mbps</div></div>
+      <div class="speed-cell"><div class="speed-val" id="speed-up-min">-</div><div class="speed-unit">Mbps</div></div>
+      <div class="speed-cell"><div class="speed-val" id="speed-up-max">-</div><div class="speed-unit">Mbps</div></div>
+    </div>
+    <div class="speed-note" id="speed-note">Samples update while the router speed test is running.</div>
+  </div>
+</div>
+
 <footer class="mono">
   Polling 192.168.100.1:9200 · <span id="last-ts">—</span>
 </footer>
@@ -1271,6 +1358,7 @@ __CHARTJS__
   var hLabels = [], hDown = [], hUp = [], MAX_PTS = 240;
   var chart;
   var pollSec = 0.5, statusTimer = null;
+  var speedTestTimer = null;
 
   function initChart() {
     chart = new Chart(document.getElementById("chart"), {
@@ -1460,6 +1548,68 @@ __CHARTJS__
     return v ? "YES" : "NO";
   }
 
+  function speedVal(v) {
+    if (v === null || v === undefined || !isFinite(Number(v))) return "-";
+    return Number(v).toFixed(1);
+  }
+
+  function setSpeedText(id, v) {
+    setText(id, speedVal(v));
+  }
+
+  function showSpeedCard(reset) {
+    var card = document.getElementById("speed-pop");
+    if (card) card.hidden = false;
+    if (reset) {
+      ["down-current", "down-min", "down-max", "up-current", "up-min", "up-max"].forEach(function(k) {
+        setText("speed-" + k, "-");
+      });
+      setText("speed-state", "Starting...");
+      setText("speed-note", "Waiting for the router to return speed-test samples.");
+    }
+  }
+
+  function updateSpeedCard(result) {
+    showSpeedCard(false);
+    var st = result && result.speedtest;
+    if (!st) {
+      setText("speed-state", result && result.ok ? "Started" : "Unavailable");
+      if (result && result.error) setText("speed-note", result.error);
+      return false;
+    }
+
+    var down = st.down || {};
+    var up = st.up || {};
+    setText("speed-state", st.running ? "Running" : "Complete");
+    setSpeedText("speed-down-current", down.current);
+    setSpeedText("speed-down-min", down.min);
+    setSpeedText("speed-down-max", down.max);
+    setSpeedText("speed-up-current", up.current);
+    setSpeedText("speed-up-min", up.min);
+    setSpeedText("speed-up-max", up.max);
+
+    var downCount = down.samples ? down.samples.length : 0;
+    var upCount = up.samples ? up.samples.length : 0;
+    setText("speed-note", "Router samples: down " + downCount + " / up " + upCount + (st.id ? " / id " + st.id : ""));
+    return !!st.running;
+  }
+
+  function pollSpeedStatus() {
+    if (speedTestTimer) clearTimeout(speedTestTimer);
+    fetch("/api/control", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "speedtest_status" })
+    }).then(function(r) {
+      return r.json().then(function(body) { body.ok = r.ok && body.ok; return body; });
+    }).then(function(body) {
+      var keepGoing = updateSpeedCard(body);
+      if (keepGoing) speedTestTimer = setTimeout(pollSpeedStatus, 750);
+    }).catch(function() {
+      setText("speed-state", "Status unavailable");
+    });
+  }
+
   function controlOutputFor(action) {
     return action.indexOf("wifi_") === 0 || action.indexOf("router_") === 0 || action.indexOf("speedtest_") === 0
       ? "router-control-output"
@@ -1478,6 +1628,10 @@ __CHARTJS__
     if (r.config) {
       Object.keys(r.config).forEach(function(k) { lines.push(k + ": " + r.config[k]); });
     }
+    if (r.speedtest) {
+      lines.push("Down current/min/max: " + speedVal(r.speedtest.down.current) + " / " + speedVal(r.speedtest.down.min) + " / " + speedVal(r.speedtest.down.max) + " Mbps");
+      lines.push("Up current/min/max: " + speedVal(r.speedtest.up.current) + " / " + speedVal(r.speedtest.up.min) + " / " + speedVal(r.speedtest.up.max) + " Mbps");
+    }
     if (r.report) lines.push(String(r.report).slice(0, 1000));
     if (r.error) lines.push("Error: " + r.error);
     return lines.join("\\n");
@@ -1485,6 +1639,8 @@ __CHARTJS__
 
   function runControl(action, btn) {
     var out = document.getElementById(controlOutputFor(action));
+    if (action === "speedtest_start") showSpeedCard(true);
+    if (action === "speedtest_status") showSpeedCard(false);
     if (out) {
       out.className = "control-output";
       out.textContent = "Running " + action + "...";
@@ -1500,6 +1656,16 @@ __CHARTJS__
       if (out) {
         out.className = "control-output " + (body.ok ? "ok" : "err");
         out.textContent = formatControlResult(body);
+      }
+      if (action === "speedtest_status") updateSpeedCard(body);
+      if (action === "speedtest_start") {
+        setText("speed-state", body.ok ? "Started" : "Start failed");
+        if (body.ok) {
+          if (speedTestTimer) clearTimeout(speedTestTimer);
+          speedTestTimer = setTimeout(pollSpeedStatus, 750);
+        } else if (body.error) {
+          setText("speed-note", body.error);
+        }
       }
       fetchStatus();
       if (action === "dish_clear_obstruction_map") fetchObstructionMap();
@@ -1684,6 +1850,14 @@ __CHARTJS__
   if (pollSelect) {
     pollSelect.addEventListener("change", function() {
       applyPollInterval(Number(pollSelect.value));
+    });
+  }
+  var speedClose = document.getElementById("speed-close");
+  if (speedClose) {
+    speedClose.addEventListener("click", function() {
+      var card = document.getElementById("speed-pop");
+      if (card) card.hidden = true;
+      if (speedTestTimer) clearTimeout(speedTestTimer);
     });
   }
   document.querySelectorAll(".ctrl-btn[data-action]").forEach(function(btn) {
