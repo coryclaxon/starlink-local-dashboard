@@ -25,8 +25,9 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse
 
 # ── Config ─────────────────────────────────────────────────────────────────────
-STARLINK_HOST = os.environ.get("STARLINK_HOST", "192.168.100.1:9200")
-PORT          = int(os.environ.get("DASHBOARD_PORT", "8889"))
+STARLINK_HOST        = os.environ.get("STARLINK_HOST", "192.168.100.1:9200")
+STARLINK_ROUTER_HOST = os.environ.get("STARLINK_ROUTER_HOST", "192.168.2.1:9000")
+PORT                 = int(os.environ.get("DASHBOARD_PORT", "8889"))
 POLL_OPTIONS   = (0.25, 0.5, 1.0, 5.0, 10.0, 15.0, 30.0)
 POLL_SEC       = 0.5      # default polling interval
 HISTORY_MAX    = 2400     # enough headroom for faster/slower polling windows
@@ -66,12 +67,29 @@ def _ld(field: int, body: bytes) -> bytes:
     """Return a length-delimited protobuf field."""
     return _vi_enc((field << 3) | 2) + _vi_enc(len(body)) + body
 
+def _bool_field(field: int, value: bool) -> bytes:
+    """Return a protobuf bool field."""
+    return _vi_enc((field << 3) | 0) + _vi_enc(1 if value else 0)
+
 # ── The one request we ever send ───────────────────────────────────────────────
 # ToDevice { request(14): Request { get_status(1006): {} } }
 # Field 14 → wrapper Request message
 # Field 1006 → GetStatusRequest (empty)  — confirmed from sparky8512/starlink-grpc-tools
 _STATUS_REQ: bytes = _ld(1004, b"")
 _OBSTRUCTION_MAP_REQ: bytes = _ld(2008, b"")
+
+_CONTROL_REQUESTS: dict[str, tuple[str, bytes]] = {
+    "dish_stow": ("Stow dish", _ld(2002, b"")),
+    "dish_unstow": ("Unstow dish", _ld(2002, _bool_field(1, True))),
+    "dish_reboot": ("Reboot dish", _ld(1001, b"")),
+    "dish_clear_obstruction_map": ("Clear obstruction map", _ld(2017, b"")),
+    "dish_self_test": ("Run dish self-test", _ld(1031, _bool_field(1, True))),
+    "speedtest_start": ("Start speed test", _ld(1027, b"")),
+    "speedtest_status": ("Get speed-test status", _ld(1028, b"")),
+    "wifi_clients": ("Get router clients", _ld(3002, b"")),
+    "wifi_config": ("Get router config", _ld(3009, b"")),
+    "wifi_self_test": ("Run router self-test", _ld(3018, b"")),
+}
 
 # ── Generic protobuf parser ────────────────────────────────────────────────────
 def _vi_dec(data: bytes, pos: int):
@@ -145,6 +163,12 @@ def _sub(d: dict, field: int) -> dict:
 def _enum(value: int, mapping: dict[int, str], default: str = "UNKNOWN") -> str:
     return mapping.get(value, default if value == 0 else str(value))
 
+def _mask_mac(mac: str) -> str:
+    parts = mac.split(":")
+    if len(parts) != 6:
+        return mac
+    return ":".join(parts[:3] + ["XX", "XX", "XX"])
+
 # ── Starlink gRPC client ───────────────────────────────────────────────────────
 class StarlinkClient:
     _SVC    = "SpaceX.API.Device.Device"
@@ -191,6 +215,9 @@ class StarlinkClient:
     def _call_obstruction_map(self, timeout: float = 8) -> bytes | None:
         return self._rpc(_OBSTRUCTION_MAP_REQ, timeout=timeout)
 
+    def _call_request(self, request: bytes, timeout: float = 12) -> bytes | None:
+        return self._rpc(request, timeout=timeout)
+
     def get_status(self) -> dict | None:
         if self._rpc is None:
             return None
@@ -218,6 +245,25 @@ class StarlinkClient:
         except Exception as e:
             self.error = str(e)
             return None
+
+    def run_control(self, action: str) -> dict:
+        if action not in _CONTROL_REQUESTS:
+            return {"ok": False, "action": action, "error": "Unsupported action"}
+        if self._rpc is None and not self.connect():
+            return {"ok": False, "action": action, "error": self.error or "Not connected"}
+
+        label, request = _CONTROL_REQUESTS[action]
+        try:
+            raw = self._call_request(request)
+            return _parse_control_response(action, label, raw)
+        except grpc.RpcError as e:
+            self.error = f"{e.code()}: {e.details()}"
+            if e.code() == grpc.StatusCode.UNAVAILABLE:
+                self._rpc = None
+            return {"ok": False, "action": action, "label": label, "error": self.error}
+        except Exception as e:
+            self.error = str(e)
+            return {"ok": False, "action": action, "label": label, "error": self.error}
 
 # ── Response parser ────────────────────────────────────────────────────────────
 # Field numbers sourced from the open-source sparky8512/starlink-grpc-tools project.
@@ -262,6 +308,75 @@ def _find_status_bytes(raw: bytes) -> bytes | None:
                     if isinstance(b2, (bytes, bytearray)) and len(b2) > best_len:
                         best_len, best = len(b2), bytes(b2)
     return best
+
+def _parse_status_message(top: dict) -> tuple[int, str]:
+    status = _sub(top, 2)
+    return _u(status, 1), _s(status, 2)
+
+def _parse_wifi_clients(response: dict) -> list[dict]:
+    out = []
+    client_resp = _sub(response, 3002)
+    for item in client_resp.get(1, []):
+        if not isinstance(item, (bytes, bytearray)):
+            continue
+        c = _parse(item)
+        name = _s(c, 31, 1) or "Unnamed"
+        out.append({
+            "name": name,
+            "mac": _mask_mac(_s(c, 2)),
+            "ip": _s(c, 3),
+            "domain": _s(c, 22),
+            "dhcp_active": bool(_u(c, 46)),
+        })
+    return out[:50]
+
+def _parse_control_response(action: str, label: str, raw: bytes | None) -> dict:
+    if not raw:
+        return {"ok": False, "action": action, "label": label, "error": "Empty response"}
+
+    top = _parse(raw)
+    code, message = _parse_status_message(top)
+    ok = code == 0
+    result = {
+        "ok": ok,
+        "action": action,
+        "label": label,
+        "status_code": code,
+        "message": message or ("OK" if ok else "Device returned an error"),
+        "ts": time.time(),
+    }
+
+    if action == "wifi_clients":
+        clients = _parse_wifi_clients(top)
+        result["clients"] = clients
+        result["message"] = f"{len(clients)} client(s) returned"
+    elif action == "wifi_config":
+        cfg_resp = _sub(top, 3009)
+        cfg = _sub(cfg_resp, 1)
+        result["config"] = {
+            "country_code": _s(cfg, 3),
+            "setup_complete": bool(_u(cfg, 7)),
+            "version": _u(cfg, 9),
+            "mac_wan": _s(cfg, 12),
+            "mac_lan": _s(cfg, 13),
+            "channel_2ghz": _u(cfg, 19),
+        }
+        result["message"] = "Router config read"
+    elif action == "dish_self_test":
+        resp = _sub(top, 1031)
+        result["passed"] = bool(_u(resp, 1))
+        report = _s(resp, 2)
+        if report:
+            result["report"] = report[:2000]
+        result["message"] = "Dish self-test " + ("passed" if result["passed"] else "completed")
+    elif action == "wifi_self_test":
+        resp = _sub(top, 3016) or _sub(top, 3018)
+        report = _s(resp, 2)
+        if report:
+            result["report"] = report[:2000]
+        result["message"] = "Router self-test completed"
+
+    return result
 
 def _parse_dish_status(raw: bytes | None) -> dict | None:
     if not raw or len(raw) < 4:
@@ -510,6 +625,7 @@ class DataCollector:
         self._history: collections.deque = collections.deque(maxlen=HISTORY_MAX)
         self._obstruction_map: dict | None = None
         self._client  = StarlinkClient()
+        self._router_client = StarlinkClient(STARLINK_ROUTER_HOST)
         self._live    = False
         self._poll_sec = POLL_SEC
         self._wake = threading.Event()
@@ -579,6 +695,10 @@ class DataCollector:
         self._wake.set()
         return True
 
+    def run_control(self, action: str) -> dict:
+        client = self._router_client if action.startswith("wifi_") or action.startswith("speedtest_") else self._client
+        return client.run_control(action)
+
     @property
     def obstruction_map(self) -> dict:
         with self._lock:
@@ -613,6 +733,18 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         p = urlparse(self.path).path
+        if p == "/api/control":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                body = self.rfile.read(length).decode("utf-8") if length else "{}"
+                action = str(json.loads(body).get("action", ""))
+            except Exception:
+                self.send_error(400, "Invalid control request")
+                return
+            result = _collector.run_control(action)
+            self._send(200 if result.get("ok") else 400, "application/json", json.dumps(result).encode())
+            return
+
         if p != "/api/poll":
             self.send_error(404)
             return
@@ -761,6 +893,17 @@ main{padding:18px 24px;}
 .ready-pill{border:1px solid var(--bdr);border-radius:4px;padding:4px 6px;font-size:10px;
   font-family:monospace;color:var(--muted);background:#090A0B;}
 .ready-pill.on{color:#FFFFFF;border-color:#C9CED4;}
+.controls-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin-top:12px;}
+.ctrl-grid{display:flex;flex-wrap:wrap;gap:8px;}
+.ctrl-btn{height:32px;background:#090A0B;color:#F4F7FA;border:1px solid var(--bdr);border-radius:4px;
+  padding:0 10px;font-family:monospace;font-size:12px;cursor:pointer;}
+.ctrl-btn:hover{border-color:#D6DADE;}
+.ctrl-btn.warn{border-color:#73512C;color:#FFB04D;}
+.ctrl-btn:disabled{opacity:.45;cursor:wait;}
+.control-output{margin-top:12px;border-top:1px solid var(--faint);padding-top:10px;
+  font-family:monospace;font-size:12px;color:var(--muted);white-space:pre-wrap;max-height:180px;overflow:auto;}
+.control-output.ok{color:#F4F7FA;}
+.control-output.err{color:#FFB04D;}
 /* detail rows */
 .rows{display:flex;flex-direction:column;}
 .drow{display:flex;justify-content:space-between;align-items:center;
@@ -792,6 +935,7 @@ footer{text-align:center;padding:12px;font-size:11px;color:var(--faint);font-fam
   .chart-legend{gap:10px;flex-wrap:wrap;}
   .bottom{grid-template-columns:1fr;gap:10px;}
   .detail-grid{grid-template-columns:1fr;gap:10px;}
+  .controls-grid{grid-template-columns:1fr;gap:10px;}
   .sky-card{align-items:center;}
   .drow{gap:12px;}
   .drow-lbl{min-width:0;}
@@ -966,6 +1110,32 @@ footer{text-align:center;padding:12px;font-size:11px;color:var(--faint);font-fam
         <div class="drow"><span class="drow-lbl">Init stable</span><span class="drow-val" id="r-init-stable">—</span></div>
         <div class="ready-list" id="ready-list"></div>
       </div>
+    </div>
+  </div>
+
+  <div class="controls-grid">
+    <div class="card detail-card">
+      <div class="sec-lbl">Dish controls</div>
+      <div class="ctrl-grid">
+        <button class="ctrl-btn warn" data-action="dish_stow" data-confirm="Stow the dish? This may interrupt service.">Stow</button>
+        <button class="ctrl-btn warn" data-action="dish_unstow" data-confirm="Unstow the dish?">Unstow</button>
+        <button class="ctrl-btn warn" data-action="dish_reboot" data-confirm="Reboot the dish? This will interrupt service temporarily.">Reboot</button>
+        <button class="ctrl-btn" data-action="dish_clear_obstruction_map" data-confirm="Clear the obstruction map? The dish will rebuild obstruction history over time.">Clear map</button>
+        <button class="ctrl-btn" data-action="dish_self_test">Self-test</button>
+        <button class="ctrl-btn" data-action="speedtest_start">Start speed test</button>
+        <button class="ctrl-btn" data-action="speedtest_status">Speed status</button>
+      </div>
+      <div class="control-output" id="dish-control-output">No dish action run yet.</div>
+    </div>
+
+    <div class="card detail-card">
+      <div class="sec-lbl">Router controls</div>
+      <div class="ctrl-grid">
+        <button class="ctrl-btn" data-action="wifi_clients">Clients</button>
+        <button class="ctrl-btn" data-action="wifi_config">Config</button>
+        <button class="ctrl-btn" data-action="wifi_self_test">Self-test</button>
+      </div>
+      <div class="control-output" id="router-control-output">No router action run yet.</div>
     </div>
   </div>
 </main>
@@ -1173,6 +1343,57 @@ __CHARTJS__
     return v ? "YES" : "NO";
   }
 
+  function controlOutputFor(action) {
+    return action.indexOf("wifi_") === 0 ? "router-control-output" : "dish-control-output";
+  }
+
+  function formatControlResult(r) {
+    var lines = [(r.label || r.action || "Action") + ": " + (r.message || (r.ok ? "OK" : "Failed"))];
+    if (r.clients) {
+      if (!r.clients.length) lines.push("No clients returned.");
+      r.clients.slice(0, 12).forEach(function(c) {
+        lines.push("- " + (c.name || "Unnamed") + "  " + (c.ip || "") + "  " + (c.mac || ""));
+      });
+      if (r.clients.length > 12) lines.push("... " + (r.clients.length - 12) + " more");
+    }
+    if (r.config) {
+      Object.keys(r.config).forEach(function(k) { lines.push(k + ": " + r.config[k]); });
+    }
+    if (r.report) lines.push(String(r.report).slice(0, 1000));
+    if (r.error) lines.push("Error: " + r.error);
+    return lines.join("\\n");
+  }
+
+  function runControl(action, btn) {
+    var out = document.getElementById(controlOutputFor(action));
+    if (out) {
+      out.className = "control-output";
+      out.textContent = "Running " + action + "...";
+    }
+    if (btn) btn.disabled = true;
+    fetch("/api/control", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: action })
+    }).then(function(r) {
+      return r.json().then(function(body) { body.ok = r.ok && body.ok; return body; });
+    }).then(function(body) {
+      if (out) {
+        out.className = "control-output " + (body.ok ? "ok" : "err");
+        out.textContent = formatControlResult(body);
+      }
+      fetchStatus();
+      if (action === "dish_clear_obstruction_map") fetchObstructionMap();
+    }).catch(function(e) {
+      if (out) {
+        out.className = "control-output err";
+        out.textContent = "Control request failed.";
+      }
+    }).finally(function() {
+      if (btn) btn.disabled = false;
+    });
+  }
+
   function update(d) {
     setText("v-down",  d.down);
     setText("v-up",    d.up);
@@ -1333,6 +1554,13 @@ __CHARTJS__
       applyPollInterval(Number(pollSelect.value));
     });
   }
+  document.querySelectorAll(".ctrl-btn[data-action]").forEach(function(btn) {
+    btn.addEventListener("click", function() {
+      var msg = btn.getAttribute("data-confirm");
+      if (msg && !confirm(msg)) return;
+      runControl(btn.getAttribute("data-action"), btn);
+    });
+  });
   setInterval(fetchHistory, 30000);
   setInterval(fetchObstructionMap, 30000);
 })();
@@ -1347,7 +1575,8 @@ def main():
     print("=" * 62)
     print("  Starlink Local Dashboard")
     print("=" * 62)
-    print(f"  Dish target : {STARLINK_HOST}")
+    print(f"  Dish target  : {STARLINK_HOST}")
+    print(f"  Router target: {STARLINK_ROUTER_HOST}")
 
     _collector = DataCollector()
     _collector.start()

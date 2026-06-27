@@ -15,6 +15,7 @@ The public screenshot is cropped to avoid showing terminal-specific identifiers.
 - Throughput, latency, packet loss, uptime, and system status
 - Real Starlink obstruction-map rendering from `dish_get_obstruction_map`
 - Terminal details including hardware, software, boot count, service class, mobility class, GPS status, Ethernet link speed, router ID, alignment, update state, and ready-state flags
+- Safe local controls for dish actions and router diagnostics
 - Local-only browser dashboard with no cloud service required
 - Demo fallback mode when the dish is unreachable
 
@@ -47,12 +48,14 @@ http://localhost:8889
 Environment variables:
 
 - `STARLINK_HOST`: dish address, default `192.168.100.1:9200`
+- `STARLINK_ROUTER_HOST`: router gRPC address, default `192.168.2.1:9000`
 - `DASHBOARD_PORT`: local web port, default `8889`
 
 Example:
 
 ```powershell
 $env:STARLINK_HOST = "192.168.100.1:9200"
+$env:STARLINK_ROUTER_HOST = "192.168.2.1:9000"
 $env:DASHBOARD_PORT = "8889"
 python starlink_dashboard.py
 ```
@@ -61,4 +64,6 @@ python starlink_dashboard.py
 
 - The status call is lightweight enough for sub-second polling, but the dish may not update every metric that quickly.
 - The obstruction map is intentionally polled more slowly because it returns a much larger grid.
+- Router controls require the local Starlink router gRPC endpoint. If your router uses a different gateway, set `STARLINK_ROUTER_HOST`.
+- Dangerous controls such as factory reset, RF/GPS inhibit, SSID/password mutation, and test-mode commands are intentionally not exposed.
 - This project uses Starlink's local device API and may need updates if Starlink firmware changes field numbers or response formats.
