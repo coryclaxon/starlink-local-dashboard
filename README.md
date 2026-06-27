@@ -4,6 +4,10 @@ A single-file local dashboard for monitoring a Starlink terminal over the dish's
 
 The dashboard runs locally, talks to `192.168.100.1:9200`, and serves a browser UI at `http://localhost:8889`.
 
+![Starlink Local Dashboard screenshot](docs/screenshot.png)
+
+The public screenshot is cropped to avoid showing terminal-specific identifiers.
+
 ## Features
 
 - Live dish status over local gRPC
