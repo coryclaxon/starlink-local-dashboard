@@ -88,20 +88,8 @@ _CONTROL_REQUESTS: dict[str, tuple[str, bytes]] = {
     "dish_clear_obstruction_map": ("Clear obstruction map", _ld(2017, b"")),
     "dish_self_test": ("Run dish self-test", _ld(1031, _bool_field(1, True))),
     "dish_get_device_info": ("Get dish device info", _ld(1008, b"")),
-    "dish_get_context": ("Get dish context", _ld(2003, b"")),
     "dish_get_config": ("Get dish config", _ld(2011, b"")),
-    "dish_get_data": ("Get dish data", _ld(2015, b"")),
     "dish_get_diagnostics": ("Get dish diagnostics", _ld(6000, b"")),
-    "dish_get_location": ("Get dish location", _ld(1017, b"")),
-    "dish_get_log": ("Get dish log", _ld(1012, b"")),
-    "dish_get_network_interfaces": ("Get network interfaces", _ld(1015, b"")),
-    "dish_get_persistent_stats": ("Get persistent stats", _ld(1022, b"")),
-    "dish_get_connections": ("Get connections", _ld(1023, b"")),
-    "dish_get_emc": ("Get EMC state", _ld(2009, b"")),
-    "dish_get_rssi_scan_result": ("Get RSSI scan result", _ld(2020, b"")),
-    "dish_get_radio_stats": ("Get radio stats", _ld(1036, b"")),
-    "dish_get_goroutine_stack_traces": ("Get stack traces", _ld(1041, b"")),
-    "dish_time": ("Get device time", _ld(1037, b"")),
     "dish_user_reported_issue": ("Send user issue marker", _ld(2029, b"")),
     "dish_inhibit_gps_on": ("Inhibit GPS on", _ld(2014, _bool_field(1, True))),
     "dish_inhibit_gps_off": ("Inhibit GPS off", _ld(2014, _bool_field(1, False))),
@@ -117,10 +105,7 @@ _CONTROL_REQUESTS: dict[str, tuple[str, bytes]] = {
     "wifi_clients": ("Get router clients", _ld(3002, b"")),
     "wifi_config": ("Get router config", _ld(3009, b"")),
     "wifi_status": ("Get router status", _ld(1004, b"")),
-    "wifi_ping_metrics": ("Get Wi-Fi ping metrics", _ld(3007, b"")),
-    "wifi_firewall": ("Get firewall rules", _ld(3024, b"")),
     "wifi_guest_info": ("Get guest info", _ld(3020, b"")),
-    "wifi_backhaul_stats": ("Get backhaul stats", _ld(3029, b"")),
     "wifi_diagnostics": ("Get router diagnostics", _ld(6000, b"")),
     "wifi_self_test": ("Run router self-test", _ld(3018, b"")),
     "wifi_run_self_test": ("Run extended router self-test", _ld(3028, b"")),
@@ -544,6 +529,117 @@ def _parse_control_response(action: str, label: str, raw: bytes | None) -> dict:
             "channel_2ghz": _u(cfg, 19),
         }
         result["message"] = "Router config read"
+    elif action == "dish_get_diagnostics":
+        resp = _sub(top, 6001) or _sub(top, 6000)
+        alerts = _sub(resp, 5)
+        loc = _sub(resp, 8)
+        align = _sub(resp, 9)
+        alert_names = {
+            1: "heating", 2: "thermal throttle", 3: "thermal shutdown",
+            4: "power supply thermal throttle", 5: "motors stuck",
+            6: "mast not near vertical", 7: "slow ethernet",
+            8: "software install pending", 10: "obstructed",
+        }
+        result["diagnostics"] = {
+            "id": _s(resp, 1),
+            "hardware": _s(resp, 2),
+            "software": _s(resp, 3),
+            "hardware_self_test": _u(resp, 7),
+            "disablement_code": _u(resp, 6),
+            "stowed": bool(_u(resp, 10)),
+            "overage_rate_limited": bool(_u(resp, 14)),
+            "alerts": [name for field, name in alert_names.items() if _u(alerts, field)],
+            "location": {
+                "enabled": bool(_u(loc, 1)),
+                "latitude": round(_f(loc, 2), 6),
+                "longitude": round(_f(loc, 3), 6),
+                "altitude_m": round(_f(loc, 4), 1),
+                "uncertainty_m": round(_f(loc, 6), 1),
+            },
+            "alignment": {
+                "boresight_azimuth_deg": round(_f(align, 1), 1),
+                "boresight_elevation_deg": round(_f(align, 2), 1),
+                "desired_azimuth_deg": round(_f(align, 3), 1),
+                "desired_elevation_deg": round(_f(align, 4), 1),
+            },
+        }
+        result["message"] = "Dish diagnostics read"
+    elif action == "dish_get_config":
+        cfg_resp = _sub(top, 2011)
+        cfg = _sub(cfg_resp, 1)
+        result["config"] = {
+            "snow_melt_mode": _u(cfg, 2),
+            "location_request_mode": _u(cfg, 9),
+            "power_save_start_minutes": _u(cfg, 4),
+            "power_save_duration_minutes": _u(cfg, 5),
+            "power_save_mode": bool(_u(cfg, 6)),
+            "apply_flags": len([k for k in cfg.keys() if k > 1000 and _u(cfg, k)]),
+        }
+        result["message"] = "Dish config read"
+    elif action == "wifi_status":
+        resp = _sub(top, 3004) or _sub(top, 1004)
+        dev = _sub(resp, 3)
+        state = _sub(resp, 4)
+        alerts = _sub(resp, 1010)
+        poe = _sub(resp, 1022)
+        swu = _sub(resp, 1025)
+        result["router_status"] = {
+            "id": _s(dev, 1),
+            "hardware": _s(dev, 2),
+            "software": _s(dev, 3),
+            "country_code": _s(dev, 4),
+            "uptime_s": _u(state, 1),
+            "ipv4_wan": _s(resp, 1003),
+            "ipv6_wan": [_s({"v": [v]}, "v") for v in resp.get(1017, []) if isinstance(v, (bytes, bytearray))],
+            "dish_id": _s(resp, 1023),
+            "ping_latency_ms": round(_f(resp, 1005), 1),
+            "ping_drop_rate_pct": round(_f(resp, 1004) * 100, 3),
+            "dish_ping_latency_ms": round(_f(resp, 1013), 1),
+            "pop_ping_latency_ms": round(_f(resp, 1015), 1),
+            "pop_ipv6_ping_latency_ms": round(_f(resp, 1029), 1),
+            "secs_since_public_ipv4_change": round(_f(resp, 1030), 1),
+            "dish_disablement_code": _u(resp, 1031),
+            "no_wan_link": bool(_u(resp, 1035)),
+            "calibration_state": _u(resp, 1033),
+            "setup_requirement": bool(_sub(resp, 1026)),
+            "software_update_state": _u(swu, 1),
+            "software_update_progress": round(_f(swu, 3), 3),
+            "poe_power_w": round(_f(poe, 2), 1),
+            "poe_voltage_v": round(_f(poe, 7), 1),
+            "poe_state": _u(poe, 1),
+            "alerts": [field for field in alerts.keys()],
+        }
+        result["message"] = "Router status read"
+    elif action == "wifi_diagnostics":
+        resp = _sub(top, 6000)
+        networks = []
+        for item in resp.get(4, []):
+            if not isinstance(item, (bytes, bytearray)):
+                continue
+            n = _parse(item)
+            networks.append({
+                "domain": _s(n, 1),
+                "ipv4": _s(n, 2),
+                "ipv6": [_s({"v": [v]}, "v") for v in n.get(3, []) if isinstance(v, (bytes, bytearray))],
+                "clients_ethernet": _u(n, 10),
+                "clients_2ghz": _u(n, 11),
+                "clients_5ghz": _u(n, 12),
+            })
+        result["diagnostics"] = {
+            "id": _s(resp, 1),
+            "hardware": _s(resp, 2),
+            "software": _s(resp, 3),
+            "networks": networks,
+        }
+        result["message"] = "Router diagnostics read"
+    elif action == "wifi_guest_info":
+        resp = _sub(top, 3020)
+        result["guest"] = {
+            "enabled": bool(_u(resp, 2)),
+            "router_hardware": _s(resp, 3),
+            "dish_hardware": _s(resp, 4),
+        }
+        result["message"] = "Guest info read"
     elif action == "dish_self_test":
         resp = _sub(top, 1031)
         result["passed"] = bool(_u(resp, 1))
@@ -820,6 +916,7 @@ class DataCollector:
         self._latest  = _demo()
         self._history: collections.deque = collections.deque(maxlen=HISTORY_MAX)
         self._obstruction_map: dict | None = None
+        self._details: dict = {}
         self._client  = StarlinkClient()
         self._router_client = StarlinkClient(STARLINK_ROUTER_HOST)
         self._live    = False
@@ -833,6 +930,7 @@ class DataCollector:
         connected = False
         last_try  = 0.0
         last_map  = 0.0
+        last_details = 0.0
         retry_sec = 15.0
 
         while True:
@@ -856,6 +954,10 @@ class DataCollector:
                 else:
                     power = self._client.get_dish_power() or self._router_client.get_router_power()
                     snap["power"] = power or {"available": False, "source": "not exposed", "unit": "W"}
+                    if now - last_details >= 15.0:
+                        last_details = now
+                        self._details = self._read_details()
+                    snap["advanced"] = dict(self._details)
                     if now - last_map >= 30.0:
                         last_map = now
                         omap = self._client.get_obstruction_map()
@@ -873,6 +975,24 @@ class DataCollector:
 
             self._wake.wait(self.poll_sec)
             self._wake.clear()
+
+    def _read_details(self) -> dict:
+        details = {}
+        for key, client, action in (
+            ("dish_diagnostics", self._client, "dish_get_diagnostics"),
+            ("dish_config", self._client, "dish_get_config"),
+            ("router_status", self._router_client, "wifi_status"),
+            ("router_diagnostics", self._router_client, "wifi_diagnostics"),
+            ("guest", self._router_client, "wifi_guest_info"),
+            ("clients", self._router_client, "wifi_clients"),
+            ("router_config", self._router_client, "wifi_config"),
+        ):
+            result = client.run_control(action)
+            if result.get("ok"):
+                details[key] = result
+            else:
+                details[key] = {"ok": False, "error": result.get("error", "Unavailable")}
+        return details
 
     @property
     def latest(self) -> dict:
@@ -1353,6 +1473,56 @@ footer{text-align:center;padding:12px;font-size:11px;color:var(--faint);font-fam
     </div>
   </div>
 
+  <div class="detail-grid advanced-grid">
+    <div class="card detail-card">
+      <div class="sec-lbl">Dish diagnostics</div>
+      <div class="rows">
+        <div class="drow"><span class="drow-lbl">Self-test</span><span class="drow-val" id="adv-dish-self">-</span></div>
+        <div class="drow"><span class="drow-lbl">Disablement</span><span class="drow-val" id="adv-dish-disable">-</span></div>
+        <div class="drow"><span class="drow-lbl">Stowed</span><span class="drow-val" id="adv-dish-stowed">-</span></div>
+        <div class="drow"><span class="drow-lbl">Rate limited</span><span class="drow-val" id="adv-dish-rate">-</span></div>
+        <div class="drow"><span class="drow-lbl">Diag alerts</span><span class="drow-val wide-val" id="adv-dish-alerts">-</span></div>
+      </div>
+    </div>
+    <div class="card detail-card">
+      <div class="sec-lbl">Dish config</div>
+      <div class="rows">
+        <div class="drow"><span class="drow-lbl">Snow melt</span><span class="drow-val" id="adv-dish-snow">-</span></div>
+        <div class="drow"><span class="drow-lbl">Location mode</span><span class="drow-val" id="adv-dish-location">-</span></div>
+        <div class="drow"><span class="drow-lbl">Power save</span><span class="drow-val" id="adv-dish-save">-</span></div>
+        <div class="drow"><span class="drow-lbl">Config flags</span><span class="drow-val" id="adv-dish-flags">-</span></div>
+      </div>
+    </div>
+    <div class="card detail-card">
+      <div class="sec-lbl">Router status</div>
+      <div class="rows">
+        <div class="drow"><span class="drow-lbl">WAN IPv4</span><span class="drow-val wide-val" id="adv-router-ipv4">-</span></div>
+        <div class="drow"><span class="drow-lbl">Ping</span><span class="drow-val" id="adv-router-ping">-</span></div>
+        <div class="drow"><span class="drow-lbl">Dish ping</span><span class="drow-val" id="adv-router-dishping">-</span></div>
+        <div class="drow"><span class="drow-lbl">PoE</span><span class="drow-val" id="adv-router-poe">-</span></div>
+        <div class="drow"><span class="drow-lbl">WAN link</span><span class="drow-val" id="adv-router-wan">-</span></div>
+      </div>
+    </div>
+    <div class="card detail-card">
+      <div class="sec-lbl">Router networks</div>
+      <div class="rows">
+        <div class="drow"><span class="drow-lbl">Router</span><span class="drow-val wide-val" id="adv-router-id">-</span></div>
+        <div class="drow"><span class="drow-lbl">Hardware</span><span class="drow-val" id="adv-router-hw">-</span></div>
+        <div class="drow"><span class="drow-lbl">Software</span><span class="drow-val wide-val" id="adv-router-sw">-</span></div>
+        <div class="drow"><span class="drow-lbl">Networks</span><span class="drow-val wide-val" id="adv-router-networks">-</span></div>
+      </div>
+    </div>
+    <div class="card detail-card">
+      <div class="sec-lbl">Wi-Fi clients</div>
+      <div class="rows">
+        <div class="drow"><span class="drow-lbl">Connected</span><span class="drow-val" id="adv-client-count">-</span></div>
+        <div class="drow"><span class="drow-lbl">DHCP active</span><span class="drow-val" id="adv-client-dhcp">-</span></div>
+        <div class="drow"><span class="drow-lbl">Sample</span><span class="drow-val wide-val" id="adv-client-sample">-</span></div>
+        <div class="drow"><span class="drow-lbl">Guest</span><span class="drow-val" id="adv-guest">-</span></div>
+      </div>
+    </div>
+  </div>
+
   <div class="controls-grid">
     <div class="card detail-card">
       <div class="sec-lbl">Dish controls</div>
@@ -1367,20 +1537,8 @@ footer{text-align:center;padding:12px;font-size:11px;color:var(--faint);font-fam
       </div>
       <div class="ctrl-grid" style="margin-top:8px">
         <button class="ctrl-btn" data-action="dish_get_device_info">Device info</button>
-        <button class="ctrl-btn" data-action="dish_get_context">Context</button>
         <button class="ctrl-btn" data-action="dish_get_config">Config</button>
-        <button class="ctrl-btn" data-action="dish_get_data">Data</button>
         <button class="ctrl-btn" data-action="dish_get_diagnostics">Diagnostics</button>
-        <button class="ctrl-btn" data-action="dish_get_location">Location</button>
-        <button class="ctrl-btn" data-action="dish_get_log">Log</button>
-        <button class="ctrl-btn" data-action="dish_get_network_interfaces">Interfaces</button>
-        <button class="ctrl-btn" data-action="dish_get_persistent_stats">Persistent stats</button>
-        <button class="ctrl-btn" data-action="dish_get_connections">Connections</button>
-        <button class="ctrl-btn" data-action="dish_get_emc">EMC</button>
-        <button class="ctrl-btn" data-action="dish_get_rssi_scan_result">RSSI scan</button>
-        <button class="ctrl-btn" data-action="dish_get_radio_stats">Radio stats</button>
-        <button class="ctrl-btn" data-action="dish_get_goroutine_stack_traces">Stacks</button>
-        <button class="ctrl-btn" data-action="dish_time">Time</button>
       </div>
       <div class="ctrl-grid" style="margin-top:8px">
         <button class="ctrl-btn danger" data-action="dish_inhibit_gps_on" data-confirm="Inhibit dish GPS? This can affect positioning and service behavior." data-type-confirm="CONTROL">GPS inhibit on</button>
@@ -1404,10 +1562,7 @@ footer{text-align:center;padding:12px;font-size:11px;color:var(--faint);font-fam
         <button class="ctrl-btn" data-action="wifi_clients">Clients</button>
         <button class="ctrl-btn" data-action="wifi_config">Config</button>
         <button class="ctrl-btn" data-action="wifi_status">Status</button>
-        <button class="ctrl-btn" data-action="wifi_ping_metrics">Ping metrics</button>
-        <button class="ctrl-btn" data-action="wifi_firewall">Firewall</button>
         <button class="ctrl-btn" data-action="wifi_guest_info">Guest info</button>
-        <button class="ctrl-btn" data-action="wifi_backhaul_stats">Backhaul</button>
         <button class="ctrl-btn" data-action="wifi_diagnostics">Diagnostics</button>
         <button class="ctrl-btn" data-action="wifi_self_test">Self-test</button>
         <button class="ctrl-btn" data-action="wifi_run_self_test">Extended self-test</button>
@@ -1658,6 +1813,10 @@ __CHARTJS__
     return v ? "YES" : "NO";
   }
 
+  function yesNo(v) {
+    return v ? "YES" : "NO";
+  }
+
   function watts(v) {
     return v ? Number(v).toFixed(1) + " W" : "-";
   }
@@ -1866,6 +2025,43 @@ __CHARTJS__
     setText("r-power-minmax", p.available ? watts(p.min) + " / " + watts(p.max) : "-");
     setText("r-power-voltage", p.voltage ? Number(p.voltage).toFixed(1) + " V" : "-");
     setText("r-power-source", (p.source || "not exposed") + (p.samples ? " / " + p.samples + " samples" : ""));
+
+    var adv = d.advanced || {};
+    var dd = (adv.dish_diagnostics && adv.dish_diagnostics.diagnostics) || {};
+    var dc = (adv.dish_config && adv.dish_config.config) || {};
+    var rs = (adv.router_status && adv.router_status.router_status) || {};
+    var rd = (adv.router_diagnostics && adv.router_diagnostics.diagnostics) || {};
+    var guest = (adv.guest && adv.guest.guest) || {};
+    var clients = (adv.clients && adv.clients.clients) || [];
+    var activeDhcp = clients.filter(function(c) { return c.dhcp_active; }).length;
+    var sampleNames = clients.slice(0, 4).map(function(c) { return c.name || "Unnamed"; }).join(", ");
+    var nets = rd.networks || [];
+
+    setText("adv-dish-self", dd.hardware_self_test ? String(dd.hardware_self_test) : "-");
+    setText("adv-dish-disable", dd.disablement_code ? String(dd.disablement_code) : "NONE");
+    setText("adv-dish-stowed", dd.stowed === undefined ? "-" : yesNo(dd.stowed));
+    setText("adv-dish-rate", dd.overage_rate_limited === undefined ? "-" : yesNo(dd.overage_rate_limited));
+    setText("adv-dish-alerts", dd.alerts && dd.alerts.length ? dd.alerts.join(", ") : "none");
+    setText("adv-dish-snow", dc.snow_melt_mode ? String(dc.snow_melt_mode) : "-");
+    setText("adv-dish-location", dc.location_request_mode ? String(dc.location_request_mode) : "-");
+    setText("adv-dish-save", dc.power_save_mode ? "ON" : "OFF");
+    setText("adv-dish-flags", dc.apply_flags !== undefined ? String(dc.apply_flags) : "-");
+
+    setText("adv-router-ipv4", rs.ipv4_wan || "-");
+    setText("adv-router-ping", rs.ping_latency_ms ? rs.ping_latency_ms + " ms / " + (rs.ping_drop_rate_pct || 0) + "% loss" : "-");
+    setText("adv-router-dishping", rs.dish_ping_latency_ms ? rs.dish_ping_latency_ms + " ms" : "-");
+    setText("adv-router-poe", rs.poe_power_w ? rs.poe_power_w + " W / " + rs.poe_voltage_v + " V" : "-");
+    setText("adv-router-wan", rs.no_wan_link === undefined ? "-" : (rs.no_wan_link ? "NO LINK" : "OK"));
+    setText("adv-router-id", rd.id || rs.id || "-");
+    setText("adv-router-hw", rd.hardware || rs.hardware || "-");
+    setText("adv-router-sw", rd.software || rs.software || "-");
+    setText("adv-router-networks", nets.length ? nets.map(function(n) {
+      return n.domain + " " + n.ipv4 + " (" + ((n.clients_ethernet || 0) + (n.clients_2ghz || 0) + (n.clients_5ghz || 0)) + ")";
+    }).join(" / ") : "-");
+    setText("adv-client-count", clients.length ? String(clients.length) : "-");
+    setText("adv-client-dhcp", clients.length ? String(activeDhcp) : "-");
+    setText("adv-client-sample", sampleNames || "-");
+    setText("adv-guest", guest.enabled === undefined ? "-" : yesNo(guest.enabled));
 
     var rl = document.getElementById("ready-list");
     if (rl) {
