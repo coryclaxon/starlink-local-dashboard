@@ -77,6 +77,8 @@ def _bool_field(field: int, value: bool) -> bytes:
 # Field 1006 → GetStatusRequest (empty)  — confirmed from sparky8512/starlink-grpc-tools
 _STATUS_REQ: bytes = _ld(1004, b"")
 _OBSTRUCTION_MAP_REQ: bytes = _ld(2008, b"")
+_DISH_HISTORY_REQ: bytes = _ld(1007, b"")
+_ROUTER_STATUS_REQ: bytes = _ld(1004, b"")
 
 _CONTROL_REQUESTS: dict[str, tuple[str, bytes]] = {
     "dish_reboot": ("Reboot dish", _ld(1001, b"")),
@@ -300,6 +302,34 @@ class StarlinkClient:
             self.error = str(e)
             return None
 
+    def get_dish_power(self) -> dict:
+        if self._rpc is None:
+            return {}
+        try:
+            return _parse_power_history(self._call_request(_DISH_HISTORY_REQ, timeout=8))
+        except grpc.RpcError as e:
+            self.error = f"{e.code()}: {e.details()}"
+            if e.code() == grpc.StatusCode.UNAVAILABLE:
+                self._rpc = None
+            return {}
+        except Exception as e:
+            self.error = str(e)
+            return {}
+
+    def get_router_power(self) -> dict:
+        if self._rpc is None and not self.connect():
+            return {}
+        try:
+            return _parse_router_power(self._call_request(_ROUTER_STATUS_REQ, timeout=8))
+        except grpc.RpcError as e:
+            self.error = f"{e.code()}: {e.details()}"
+            if e.code() == grpc.StatusCode.UNAVAILABLE:
+                self._rpc = None
+            return {}
+        except Exception as e:
+            self.error = str(e)
+            return {}
+
     def run_control(self, action: str) -> dict:
         if action not in _CONTROL_REQUESTS:
             return {"ok": False, "action": action, "error": "Unsupported action"}
@@ -414,6 +444,72 @@ def _speed_series(samples: list[float]) -> dict:
         "max": round(max(samples), 2),
         "avg": round(sum(samples) / len(samples), 2),
         "samples": samples[-80:],
+    }
+
+def _series_stats(samples: list[float]) -> dict:
+    clean = [x for x in samples if isinstance(x, (int, float)) and math.isfinite(x) and x > 0]
+    if not clean:
+        return {}
+    return {
+        "current": round(clean[-1], 1),
+        "min": round(min(clean), 1),
+        "max": round(max(clean), 1),
+        "avg": round(sum(clean) / len(clean), 1),
+        "samples": len(clean),
+    }
+
+def _parse_power_history(raw: bytes | None) -> dict:
+    if not raw:
+        return {}
+
+    power = []
+
+    def walk(buf, depth=0):
+        if depth > 6 or not isinstance(buf, (bytes, bytearray)) or not buf:
+            return
+        d = _parse(buf)
+        for field, vals in d.items():
+            for v in vals:
+                if field == 1010:
+                    power.extend(_packed_floats(v))
+                if isinstance(v, (bytes, bytearray)):
+                    walk(v, depth + 1)
+
+    walk(raw)
+    stats = _series_stats([x for x in power if 0 < x < 1000])
+    if not stats:
+        return {}
+    stats.update({"available": True, "source": "dish history", "unit": "W"})
+    return stats
+
+def _parse_router_power(raw: bytes | None) -> dict:
+    if not raw:
+        return {}
+    top = _parse(raw)
+    resp = _sub(top, 1004)
+    for wrapper in (1, 14):
+        if not resp:
+            resp = _sub(_sub(top, wrapper), 1004)
+    poe = _sub(resp, 1022)
+    if not poe:
+        return {}
+
+    watts = _f(poe, 2)
+    vin = _f(poe, 7)
+    state = _u(poe, 1)
+    if watts <= 0 and vin <= 0 and state == 0:
+        return {}
+    return {
+        "available": watts > 0,
+        "current": round(watts, 1) if watts > 0 else 0.0,
+        "min": round(watts, 1) if watts > 0 else 0.0,
+        "max": round(watts, 1) if watts > 0 else 0.0,
+        "avg": round(watts, 1) if watts > 0 else 0.0,
+        "samples": 1 if watts > 0 else 0,
+        "voltage": round(vin, 1) if vin > 0 else 0.0,
+        "poe_state": state,
+        "source": "router PoE",
+        "unit": "W",
     }
 
 def _parse_control_response(action: str, label: str, raw: bytes | None) -> dict:
@@ -709,6 +805,7 @@ def _demo() -> dict:
         "loss":    round(max(0.0, 0.1 + random.gauss(0, 0.04)), 3),
         "snr": 9.2, "s2ff": 0.0,
         "uptime": int(age) + 892847,
+        "power": {"available": False, "source": "demo", "unit": "W"},
         "hardware": "GEN3", "software": "demo-mode",
         "boot_count": 0,
         "obstruction_pct": 2.1, "currently_obstructed": False,
@@ -756,12 +853,15 @@ class DataCollector:
                 if snap is None:
                     connected = False
                     print(f"[starlink] Connection lost - {self._client.error}")
-                elif now - last_map >= 30.0:
-                    last_map = now
-                    omap = self._client.get_obstruction_map()
-                    if omap is not None:
-                        with self._lock:
-                            self._obstruction_map = omap
+                else:
+                    power = self._client.get_dish_power() or self._router_client.get_router_power()
+                    snap["power"] = power or {"available": False, "source": "not exposed", "unit": "W"}
+                    if now - last_map >= 30.0:
+                        last_map = now
+                        omap = self._client.get_obstruction_map()
+                        if omap is not None:
+                            with self._lock:
+                                self._obstruction_map = omap
 
             if snap is None:
                 snap = _demo()
@@ -999,7 +1099,7 @@ main{padding:18px 24px;}
 .sl-item{display:flex;align-items:center;gap:4px;font-size:10px;font-weight:600;
   text-transform:uppercase;letter-spacing:.05em;color:var(--muted);}
 .sl-dot{width:7px;height:7px;border-radius:50%;display:inline-block;}
-.detail-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-top:12px;}
+.detail-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px;margin-top:12px;}
 .detail-card{min-width:0;}
 .detail-card .drow{padding:8px 0;}
 .wide-val{max-width:58%;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
@@ -1239,6 +1339,16 @@ footer{text-align:center;padding:12px;font-size:11px;color:var(--faint);font-fam
         <div class="drow"><span class="drow-lbl">Map valid</span><span class="drow-val" id="r-map-valid">—</span></div>
         <div class="drow"><span class="drow-lbl">Init stable</span><span class="drow-val" id="r-init-stable">—</span></div>
         <div class="ready-list" id="ready-list"></div>
+      </div>
+    </div>
+    <div class="card detail-card">
+      <div class="sec-lbl">Power</div>
+      <div class="rows">
+        <div class="drow"><span class="drow-lbl">Draw now</span><span class="drow-val" id="r-power-now">-</span></div>
+        <div class="drow"><span class="drow-lbl">Average</span><span class="drow-val" id="r-power-avg">-</span></div>
+        <div class="drow"><span class="drow-lbl">Min / max</span><span class="drow-val" id="r-power-minmax">-</span></div>
+        <div class="drow"><span class="drow-lbl">Voltage</span><span class="drow-val" id="r-power-voltage">-</span></div>
+        <div class="drow"><span class="drow-lbl">Source</span><span class="drow-val" id="r-power-source">-</span></div>
       </div>
     </div>
   </div>
@@ -1548,6 +1658,10 @@ __CHARTJS__
     return v ? "YES" : "NO";
   }
 
+  function watts(v) {
+    return v ? Number(v).toFixed(1) + " W" : "-";
+  }
+
   function speedVal(v) {
     if (v === null || v === undefined || !isFinite(Number(v))) return "-";
     return Number(v).toFixed(1);
@@ -1746,6 +1860,12 @@ __CHARTJS__
     setText("r-reboot", d.reboot_reason || "-");
     setText("r-map-valid", val(d.obstruction_valid_s, " s") + " / " + val(d.obstruction_patches_valid, " patches"));
     setText("r-init-stable", d.initialization ? val(d.initialization.stable_connection, " s") : "-");
+    var p = d.power || {};
+    setText("r-power-now", p.available ? watts(p.current) : "not exposed");
+    setText("r-power-avg", p.available ? watts(p.avg) : "-");
+    setText("r-power-minmax", p.available ? watts(p.min) + " / " + watts(p.max) : "-");
+    setText("r-power-voltage", p.voltage ? Number(p.voltage).toFixed(1) + " V" : "-");
+    setText("r-power-source", (p.source || "not exposed") + (p.samples ? " / " + p.samples + " samples" : ""));
 
     var rl = document.getElementById("ready-list");
     if (rl) {
