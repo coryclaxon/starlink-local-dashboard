@@ -79,16 +79,70 @@ _STATUS_REQ: bytes = _ld(1004, b"")
 _OBSTRUCTION_MAP_REQ: bytes = _ld(2008, b"")
 
 _CONTROL_REQUESTS: dict[str, tuple[str, bytes]] = {
+    "dish_reboot": ("Reboot dish", _ld(1001, b"")),
+    "dish_factory_reset": ("Factory reset dish", _ld(2021, b"")),
     "dish_stow": ("Stow dish", _ld(2002, b"")),
     "dish_unstow": ("Unstow dish", _ld(2002, _bool_field(1, True))),
-    "dish_reboot": ("Reboot dish", _ld(1001, b"")),
     "dish_clear_obstruction_map": ("Clear obstruction map", _ld(2017, b"")),
     "dish_self_test": ("Run dish self-test", _ld(1031, _bool_field(1, True))),
+    "dish_get_device_info": ("Get dish device info", _ld(1008, b"")),
+    "dish_get_context": ("Get dish context", _ld(2003, b"")),
+    "dish_get_config": ("Get dish config", _ld(2011, b"")),
+    "dish_get_data": ("Get dish data", _ld(2015, b"")),
+    "dish_get_diagnostics": ("Get dish diagnostics", _ld(6000, b"")),
+    "dish_get_location": ("Get dish location", _ld(1017, b"")),
+    "dish_get_log": ("Get dish log", _ld(1012, b"")),
+    "dish_get_network_interfaces": ("Get network interfaces", _ld(1015, b"")),
+    "dish_get_persistent_stats": ("Get persistent stats", _ld(1022, b"")),
+    "dish_get_connections": ("Get connections", _ld(1023, b"")),
+    "dish_get_emc": ("Get EMC state", _ld(2009, b"")),
+    "dish_get_rssi_scan_result": ("Get RSSI scan result", _ld(2020, b"")),
+    "dish_get_radio_stats": ("Get radio stats", _ld(1036, b"")),
+    "dish_get_goroutine_stack_traces": ("Get stack traces", _ld(1041, b"")),
+    "dish_time": ("Get device time", _ld(1037, b"")),
+    "dish_user_reported_issue": ("Send user issue marker", _ld(2029, b"")),
+    "dish_inhibit_gps_on": ("Inhibit GPS on", _ld(2014, _bool_field(1, True))),
+    "dish_inhibit_gps_off": ("Inhibit GPS off", _ld(2014, _bool_field(1, False))),
+    "dish_inhibit_rf_on": ("Inhibit RF on", _ld(2026, _bool_field(1, True))),
+    "dish_inhibit_rf_off": ("Inhibit RF off", _ld(2026, _bool_field(1, False))),
+    "dish_max_power_test_on": ("Max power test on", _ld(2018, _bool_field(1, True))),
+    "dish_max_power_test_off": ("Max power test off", _ld(2018, _bool_field(1, False))),
+    "dish_reset_button_press": ("Simulate reset button press", _ld(2022, _bool_field(1, True))),
     "speedtest_start": ("Start speed test", _ld(1027, b"")),
     "speedtest_status": ("Get speed-test status", _ld(1028, b"")),
+    "router_reboot": ("Reboot router", _ld(1001, b"")),
+    "router_factory_reset": ("Factory reset router", _ld(1011, b"")),
     "wifi_clients": ("Get router clients", _ld(3002, b"")),
     "wifi_config": ("Get router config", _ld(3009, b"")),
+    "wifi_status": ("Get router status", _ld(1004, b"")),
+    "wifi_ping_metrics": ("Get Wi-Fi ping metrics", _ld(3007, b"")),
+    "wifi_firewall": ("Get firewall rules", _ld(3024, b"")),
+    "wifi_guest_info": ("Get guest info", _ld(3020, b"")),
+    "wifi_backhaul_stats": ("Get backhaul stats", _ld(3029, b"")),
+    "wifi_diagnostics": ("Get router diagnostics", _ld(6000, b"")),
     "wifi_self_test": ("Run router self-test", _ld(3018, b"")),
+    "wifi_run_self_test": ("Run extended router self-test", _ld(3028, b"")),
+    "wifi_calibration_mode": ("Enter Wi-Fi calibration mode", _ld(3019, b"")),
+    "wifi_toggle_poe_on": ("PoE negotiation on", _ld(3025, _bool_field(1, True))),
+    "wifi_toggle_poe_off": ("PoE negotiation off", _ld(3025, _bool_field(1, False))),
+    "wifi_umbilical_on": ("Umbilical mode on", _ld(3030, _bool_field(1, True))),
+    "wifi_umbilical_off": ("Umbilical mode off", _ld(3030, _bool_field(1, False))),
+    "wifi_reset_eth_phy": ("Reset Ethernet PHY", _ld(3033, b"")),
+    "wifi_flush_hardware_nat": ("Flush hardware NAT", _ld(3034, b"")),
+    "wifi_run_debug_netsys": ("Run router net debug", _ld(3032, b"")),
+}
+
+_ROUTER_ACTIONS = {
+    action for action in _CONTROL_REQUESTS
+    if action.startswith("wifi_") or action.startswith("router_") or action.startswith("speedtest_")
+}
+
+_DANGEROUS_ACTIONS = {
+    "dish_reboot", "dish_factory_reset", "dish_inhibit_gps_on", "dish_inhibit_rf_on",
+    "dish_max_power_test_on", "dish_reset_button_press", "router_reboot",
+    "router_factory_reset", "wifi_calibration_mode", "wifi_toggle_poe_on",
+    "wifi_toggle_poe_off", "wifi_umbilical_on", "wifi_umbilical_off",
+    "wifi_reset_eth_phy", "wifi_flush_hardware_nat", "wifi_run_debug_netsys",
 }
 
 # ── Generic protobuf parser ────────────────────────────────────────────────────
@@ -696,7 +750,22 @@ class DataCollector:
         return True
 
     def run_control(self, action: str) -> dict:
-        client = self._router_client if action.startswith("wifi_") or action.startswith("speedtest_") else self._client
+        if action not in _CONTROL_REQUESTS:
+            return {"ok": False, "action": action, "error": "Unsupported action"}
+
+        if action in ("dish_stow", "dish_unstow"):
+            with self._lock:
+                has_actuators = self._latest.get("has_actuators")
+            if has_actuators != "YES":
+                label = _CONTROL_REQUESTS[action][0]
+                return {
+                    "ok": False,
+                    "action": action,
+                    "label": label,
+                    "error": "This dish reports no adjustment motors, so stow/unstow is disabled for this hardware.",
+                }
+
+        client = self._router_client if action in _ROUTER_ACTIONS else self._client
         return client.run_control(action)
 
     @property
@@ -899,7 +968,8 @@ main{padding:18px 24px;}
   padding:0 10px;font-family:monospace;font-size:12px;cursor:pointer;}
 .ctrl-btn:hover{border-color:#D6DADE;}
 .ctrl-btn.warn{border-color:#73512C;color:#FFB04D;}
-.ctrl-btn:disabled{opacity:.45;cursor:wait;}
+.ctrl-btn.danger{border-color:#8B2D2D;color:#FF6B6B;}
+.ctrl-btn:disabled{opacity:.45;cursor:not-allowed;}
 .control-output{margin-top:12px;border-top:1px solid var(--faint);padding-top:10px;
   font-family:monospace;font-size:12px;color:var(--muted);white-space:pre-wrap;max-height:180px;overflow:auto;}
 .control-output.ok{color:#F4F7FA;}
@@ -1120,10 +1190,36 @@ footer{text-align:center;padding:12px;font-size:11px;color:var(--faint);font-fam
         <button class="ctrl-btn warn" data-action="dish_stow" data-confirm="Stow the dish? This may interrupt service.">Stow</button>
         <button class="ctrl-btn warn" data-action="dish_unstow" data-confirm="Unstow the dish?">Unstow</button>
         <button class="ctrl-btn warn" data-action="dish_reboot" data-confirm="Reboot the dish? This will interrupt service temporarily.">Reboot</button>
+        <button class="ctrl-btn danger" data-action="dish_factory_reset" data-confirm="Factory reset the dish? This can remove configuration and interrupt service." data-type-confirm="CONTROL">Factory reset</button>
         <button class="ctrl-btn" data-action="dish_clear_obstruction_map" data-confirm="Clear the obstruction map? The dish will rebuild obstruction history over time.">Clear map</button>
         <button class="ctrl-btn" data-action="dish_self_test">Self-test</button>
-        <button class="ctrl-btn" data-action="speedtest_start">Start speed test</button>
-        <button class="ctrl-btn" data-action="speedtest_status">Speed status</button>
+        <button class="ctrl-btn" data-action="dish_user_reported_issue">Issue marker</button>
+      </div>
+      <div class="ctrl-grid" style="margin-top:8px">
+        <button class="ctrl-btn" data-action="dish_get_device_info">Device info</button>
+        <button class="ctrl-btn" data-action="dish_get_context">Context</button>
+        <button class="ctrl-btn" data-action="dish_get_config">Config</button>
+        <button class="ctrl-btn" data-action="dish_get_data">Data</button>
+        <button class="ctrl-btn" data-action="dish_get_diagnostics">Diagnostics</button>
+        <button class="ctrl-btn" data-action="dish_get_location">Location</button>
+        <button class="ctrl-btn" data-action="dish_get_log">Log</button>
+        <button class="ctrl-btn" data-action="dish_get_network_interfaces">Interfaces</button>
+        <button class="ctrl-btn" data-action="dish_get_persistent_stats">Persistent stats</button>
+        <button class="ctrl-btn" data-action="dish_get_connections">Connections</button>
+        <button class="ctrl-btn" data-action="dish_get_emc">EMC</button>
+        <button class="ctrl-btn" data-action="dish_get_rssi_scan_result">RSSI scan</button>
+        <button class="ctrl-btn" data-action="dish_get_radio_stats">Radio stats</button>
+        <button class="ctrl-btn" data-action="dish_get_goroutine_stack_traces">Stacks</button>
+        <button class="ctrl-btn" data-action="dish_time">Time</button>
+      </div>
+      <div class="ctrl-grid" style="margin-top:8px">
+        <button class="ctrl-btn danger" data-action="dish_inhibit_gps_on" data-confirm="Inhibit dish GPS? This can affect positioning and service behavior." data-type-confirm="CONTROL">GPS inhibit on</button>
+        <button class="ctrl-btn warn" data-action="dish_inhibit_gps_off" data-confirm="Turn dish GPS inhibit off?">GPS inhibit off</button>
+        <button class="ctrl-btn danger" data-action="dish_inhibit_rf_on" data-confirm="Inhibit dish RF? This can interrupt Starlink service." data-type-confirm="CONTROL">RF inhibit on</button>
+        <button class="ctrl-btn warn" data-action="dish_inhibit_rf_off" data-confirm="Turn dish RF inhibit off?">RF inhibit off</button>
+        <button class="ctrl-btn danger" data-action="dish_max_power_test_on" data-confirm="Enable max power test mode? This is a hardware test mode." data-type-confirm="CONTROL">Max power on</button>
+        <button class="ctrl-btn warn" data-action="dish_max_power_test_off" data-confirm="Disable max power test mode?">Max power off</button>
+        <button class="ctrl-btn danger" data-action="dish_reset_button_press" data-confirm="Simulate a dish reset button press?" data-type-confirm="CONTROL">Reset button</button>
       </div>
       <div class="control-output" id="dish-control-output">No dish action run yet.</div>
     </div>
@@ -1131,9 +1227,30 @@ footer{text-align:center;padding:12px;font-size:11px;color:var(--faint);font-fam
     <div class="card detail-card">
       <div class="sec-lbl">Router controls</div>
       <div class="ctrl-grid">
+        <button class="ctrl-btn warn" data-action="router_reboot" data-confirm="Reboot the router? Wi-Fi will disconnect temporarily.">Reboot</button>
+        <button class="ctrl-btn danger" data-action="router_factory_reset" data-confirm="Factory reset the router? This can remove Wi-Fi configuration." data-type-confirm="CONTROL">Factory reset</button>
+        <button class="ctrl-btn" data-action="speedtest_start">Start speed test</button>
+        <button class="ctrl-btn" data-action="speedtest_status">Speed status</button>
         <button class="ctrl-btn" data-action="wifi_clients">Clients</button>
         <button class="ctrl-btn" data-action="wifi_config">Config</button>
+        <button class="ctrl-btn" data-action="wifi_status">Status</button>
+        <button class="ctrl-btn" data-action="wifi_ping_metrics">Ping metrics</button>
+        <button class="ctrl-btn" data-action="wifi_firewall">Firewall</button>
+        <button class="ctrl-btn" data-action="wifi_guest_info">Guest info</button>
+        <button class="ctrl-btn" data-action="wifi_backhaul_stats">Backhaul</button>
+        <button class="ctrl-btn" data-action="wifi_diagnostics">Diagnostics</button>
         <button class="ctrl-btn" data-action="wifi_self_test">Self-test</button>
+        <button class="ctrl-btn" data-action="wifi_run_self_test">Extended self-test</button>
+      </div>
+      <div class="ctrl-grid" style="margin-top:8px">
+        <button class="ctrl-btn danger" data-action="wifi_calibration_mode" data-confirm="Enter Wi-Fi calibration mode? This is a factory/test behavior." data-type-confirm="CONTROL">Calibration mode</button>
+        <button class="ctrl-btn danger" data-action="wifi_toggle_poe_on" data-confirm="Toggle PoE negotiation on?" data-type-confirm="CONTROL">PoE on</button>
+        <button class="ctrl-btn danger" data-action="wifi_toggle_poe_off" data-confirm="Toggle PoE negotiation off?" data-type-confirm="CONTROL">PoE off</button>
+        <button class="ctrl-btn danger" data-action="wifi_umbilical_on" data-confirm="Enable umbilical mode?" data-type-confirm="CONTROL">Umbilical on</button>
+        <button class="ctrl-btn danger" data-action="wifi_umbilical_off" data-confirm="Disable umbilical mode?" data-type-confirm="CONTROL">Umbilical off</button>
+        <button class="ctrl-btn danger" data-action="wifi_reset_eth_phy" data-confirm="Reset the router Ethernet PHY? Wired connectivity may drop briefly." data-type-confirm="CONTROL">Reset ETH PHY</button>
+        <button class="ctrl-btn danger" data-action="wifi_flush_hardware_nat" data-confirm="Flush hardware NAT? Active connections may be interrupted." data-type-confirm="CONTROL">Flush NAT</button>
+        <button class="ctrl-btn danger" data-action="wifi_run_debug_netsys" data-confirm="Run router network debug? This can take a moment." data-type-confirm="CONTROL">Net debug</button>
       </div>
       <div class="control-output" id="router-control-output">No router action run yet.</div>
     </div>
@@ -1344,7 +1461,9 @@ __CHARTJS__
   }
 
   function controlOutputFor(action) {
-    return action.indexOf("wifi_") === 0 ? "router-control-output" : "dish-control-output";
+    return action.indexOf("wifi_") === 0 || action.indexOf("router_") === 0 || action.indexOf("speedtest_") === 0
+      ? "router-control-output"
+      : "dish-control-output";
   }
 
   function formatControlResult(r) {
@@ -1390,7 +1509,18 @@ __CHARTJS__
         out.textContent = "Control request failed.";
       }
     }).finally(function() {
-      if (btn) btn.disabled = false;
+      if (btn) {
+        btn.disabled = false;
+        applyHardwareControlState();
+      }
+    });
+  }
+
+  function applyHardwareControlState(d) {
+    var hasActuators = d ? d.has_actuators === "YES" : document.body.getAttribute("data-has-actuators") === "YES";
+    document.querySelectorAll('[data-action="dish_stow"],[data-action="dish_unstow"]').forEach(function(btn) {
+      btn.disabled = !hasActuators;
+      btn.title = hasActuators ? "" : "This dish reports no adjustment motors; stow/unstow is disabled.";
     });
   }
 
@@ -1444,6 +1574,8 @@ __CHARTJS__
     setText("r-des-el", d.alignment ? val(d.alignment.desired_elevation_deg, "°") : "-");
     setText("r-uncert", d.alignment ? val(d.alignment.attitude_uncertainty_deg, "°") : "-");
     setText("r-actuators", d.has_actuators || "-");
+    document.body.setAttribute("data-has-actuators", d.has_actuators || "");
+    applyHardwareControlState(d);
     setText("r-update", (d.software_update_state || "-") + " / " + Math.round((d.software_update_progress || 0) * 100) + "%");
     setText("r-reboot", d.reboot_reason || "-");
     setText("r-map-valid", val(d.obstruction_valid_s, " s") + " / " + val(d.obstruction_patches_valid, " patches"));
@@ -1558,9 +1690,15 @@ __CHARTJS__
     btn.addEventListener("click", function() {
       var msg = btn.getAttribute("data-confirm");
       if (msg && !confirm(msg)) return;
+      var typeConfirm = btn.getAttribute("data-type-confirm");
+      if (typeConfirm) {
+        var typed = prompt((msg || "Confirm this control.") + "\\n\\nType " + typeConfirm + " to continue.");
+        if (typed !== typeConfirm) return;
+      }
       runControl(btn.getAttribute("data-action"), btn);
     });
   });
+  applyHardwareControlState();
   setInterval(fetchHistory, 30000);
   setInterval(fetchObstructionMap, 30000);
 })();
